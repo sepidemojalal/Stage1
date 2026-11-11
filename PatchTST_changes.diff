@@ -1,0 +1,1302 @@
+diff --git a/README.md b/README.md
+index 18c0c60..bc1d858 100644
+--- a/README.md
++++ b/README.md
+@@ -116,9 +116,9 @@ Input: (batch, 10 timesteps, 4 features)
+ 
+ ## Evaluation protocol
+ 
+-1. **Bootstrap MSE:** 50 independent trials, each drawing 20 samples **without replacement** from the 92 test blocks
+-2. **Confidence interval:** Student-t 95 % CI computed from the 50 MSE values (`df = 49`)
+-3. **Statistical significance:** CI non-overlap between two models ≡ ANOVA alternative hypothesis H₁ (statistically significant difference)
++1. **Error metrics:** test MAE and MSE on the 92 test blocks of each vehicle (the same blocks for all three models); training MAE and MSE of each model on its own training blocks are reported alongside
++2. **Confidence interval:** 95 % BCa bootstrap interval of the MAE — B = 10,000 resamples of the 92 blocks **with replacement**, bias correction ẑ₀, jackknife acceleration â, percentiles with linear interpolation (`src/bca.py`, following the protocol *BCa Bootstrap Confidence Intervals for the Mean Absolute Error of Predicted Vehicle Acceleration*). The three models of a vehicle are evaluated on the same resamples.
++3. **No validation set:** every model trains on its training blocks only, for a fixed number of epochs (100) with a constant learning rate, and keeps its final weights. The test blocks are used only for the final scores.
+ 
+ ---
+ 
+@@ -135,8 +135,9 @@ PatchTST-Vehicle-Acceleration/
+ ├── src/
+ │   ├── data_utils.py        ← Dataset class, CDT builder
+ │   ├── model.py             ← PatchTSTRegressor (HuggingFace backbone + head)
+-│   ├── train.py             ← Training loop (Adam, early stopping, checkpoint)
+-│   ├── evaluate.py          ← Bootstrap MSE, 95 % CI, CI overlap test
++│   ├── train.py             ← Training loop (Adam, fixed epochs, final weights)
++│   ├── evaluate.py          ← MAE, MSE, BCa 95 % CI of the MAE
++│   ├── bca.py               ← BCa bootstrap protocol, step by step
+ │   ├── plot.py              ← Per-vehicle 2-panel PNG
+ │   └── save_results.py      ← Excel (30-sheet + summary) and CSV writers
+ │
+@@ -176,16 +177,18 @@ pip install -r requirements.txt
+ python main.py --data data/your_ngsim_file.csv
+ ```
+ 
++A missing or wrong `--data` path stops the run with an error.
++
+ ### Run with synthetic data (no CSV needed)
+ 
+ ```bash
+-python main.py
++python main.py --synthetic
+ ```
+ 
+ ### Quick test (5 vehicles, 20 epochs)
+ 
+ ```bash
+-python main.py --vehicles 5 --epochs 20
++python main.py --synthetic --vehicles 5 --epochs 20
+ ```
+ 
+ ### All command-line options
+@@ -193,11 +196,12 @@ python main.py --vehicles 5 --epochs 20
+ ```
+ python main.py --help
+ 
+-  --data      Path to NGSIM CSV file
++  --data      Path to NGSIM CSV file (required unless --synthetic)
++  --synthetic Use synthetic NGSIM-like data (testing only)
+   --vehicles  Number of vehicles to process          [default: 30]
+-  --epochs    Maximum training epochs per model      [default: 300]
++  --epochs    Training epochs per model (fixed)      [default: 100]
+   --batch     Mini-batch size                        [default: 32]
+-  --trials    Bootstrap trials for MSE CI            [default: 50]
++  --boot      Bootstrap resamples for the BCa CI     [default: 10000]
+   --d_model   Transformer embedding dimension        [default: 64]
+   --heads     Number of attention heads              [default: 4]
+   --layers    Number of Transformer encoder layers   [default: 2]
+@@ -215,8 +219,9 @@ All outputs are written to `outputs/` automatically:
+ | `outputs/checkpoints/cdt_full.pt` | Best weights for CDT with Full Data |
+ | `outputs/checkpoints/cdt_limited.pt` | Best weights for CDT with Limited Data |
+ | `outputs/plots/vehicle_N.png` | 2-panel PNG: loss curves + test predictions |
+-| `outputs/predictions_all_vehicles.xlsx` | 30 sheets · 11 columns each |
+-| `outputs/metrics_summary.xlsx` | MSE + 95 % CI for all models and vehicles |
++| `outputs/predictions_all_vehicles.xlsx` | 30 sheets · 12 columns each |
++| `outputs/predictions/V{N}_Transformer_Predictions.csv` | Per-vehicle predictions: idx, a1_true, CDT_full_pred, User_specific_pred, CDT_limited_pred |
++| `outputs/metrics_summary.xlsx` | MAE, MSE + 95 % BCa CI of the MAE for all models and vehicles |
+ | `outputs/patchtst_results.csv` | Raw per-vehicle results for downstream analysis |
+ 
+ ### Predictions Excel columns
+@@ -224,6 +229,7 @@ All outputs are written to `outputs/` automatically:
+ | Column | Description |
+ |---|---|
+ | `block_index` | Test block index (0–91) |
++| `idx` | Row identifier of the predicted (target) row |
+ | `ground_truth` | Actual acceleration (m/s²) |
+ | `pred_user_specific` | User-Specific PatchTST prediction |
+ | `pred_cdt_full` | CDT with Full Data prediction |
+@@ -236,13 +242,13 @@ All outputs are written to `outputs/` automatically:
+ | Column | Description |
+ |---|---|
+ | `vehicle_id` | Vehicle identifier (1–30), plus MEAN row |
+-| `best_model` | Model with lowest MSE for this vehicle |
+-| `ranking` | Models ranked lowest → highest MSE |
+-| `US_MSE_mean` | Bootstrapped mean MSE — User-Specific |
+-| `US_MSE_CI_low/high` | 95 % CI bounds — User-Specific |
+-| `CDT_MSE_mean/CI_*` | Same for CDT with Full Data |
+-| `LTD_MSE_mean/CI_*` | Same for CDT with Limited Data |
+-| `US_CDT_CI_overlap` | True = null H₀; False = alt H₁ (significant) |
++| `best_model` | Model with lowest MAE for this vehicle |
++| `ranking` | Models ranked lowest → highest MAE |
++| `US_MAE`, `US_MSE` | MAE and MSE on the 92 test blocks — User-Specific |
++| `US_BCa_CI_low/high` | 95 % BCa CI of the MAE — User-Specific |
++| `CDT_*` | Same for CDT with Full Data |
++| `LTD_*` | Same for CDT with Limited Data |
++| `US_CDT_CI_overlap` | Whether the US and CDT intervals overlap (descriptive) |
+ 
+ ---
+ 
+@@ -261,15 +267,14 @@ NHEAD      = 4       # attention heads
+ NUM_LAYERS = 2       # encoder layers
+ DROPOUT    = 0.1
+ 
+-# Training
+-EPOCHS              = 300
+-LR                  = 1e-3
+-EARLY_STOP_PATIENCE = 10
++# Training (no validation set; final weights kept)
++EPOCHS              = 100     # fixed
++LR                  = 1e-3    # constant
+ BATCH_SIZE          = 32
+ 
+-# Evaluation
+-N_BOOTSTRAP_TRIALS = 50
+-BOOTSTRAP_SAMPLE   = 20
++# Evaluation (BCa CI of the MAE)
++BCA_B     = 10_000
++BCA_ALPHA = 0.025
+ 
+ # CDT limited dataset
+ LIMITED_N    = 9
+diff --git a/config.py b/config.py
+index 778957a..ae8adce 100644
+--- a/config.py
++++ b/config.py
+@@ -66,27 +66,35 @@ FFN_DIM             = 128             # feed-forward hidden dimension  (2 × D_M
+ DROPOUT             = 0.1             # attention + FF dropout rate
+ 
+ # ── Training ──────────────────────────────────────────────────────────────────
++# No validation set: every model trains for a fixed number of epochs with a
++# constant learning rate and keeps its final weights. The test blocks are used
++# only once, at the end, for the scores.
+ BATCH_SIZE          = 32
+-EPOCHS              = 300             # maximum; early stopping usually triggers earlier
+-LR                  = 1e-3            # Adam initial learning rate
+-LR_PATIENCE         = 5               # ReduceLROnPlateau patience (epochs)
+-LR_FACTOR           = 0.5             # LR reduction factor
+-EARLY_STOP_PATIENCE = 10              # stop if val MSE does not improve for N epochs
++EPOCHS              = 100             # fixed number of training epochs
++LR                  = 1e-3            # Adam learning rate (constant)
+ GRAD_CLIP           = 1.0             # gradient clipping (ℓ₂ norm)
+ 
+ # ── Evaluation ────────────────────────────────────────────────────────────────
+-# Bootstrap MSE protocol — matches dissertation Stage 1 evaluation exactly:
+-#   50 independent trials, each drawing 20 samples without replacement from
+-#   the 92 test blocks.  Student-t 95 % CI computed across the 50 MSE values.
+-#   CI non-overlap ≡ ANOVA alternative hypothesis (statistically significant
+-#   difference between models).
+-N_BOOTSTRAP_TRIALS = 50
+-BOOTSTRAP_SAMPLE   = 20   # samples per trial (without replacement)
++# BCa bootstrap confidence interval for the MAE, following the protocol
++# "BCa Bootstrap Confidence Intervals for the Mean Absolute Error of Predicted
++# Vehicle Acceleration" (Efron & Tibshirani, 1993):
++#   B = 10,000 resamples of the 92 test blocks WITH replacement, bias
++#   correction ẑ0, jackknife acceleration â, 95 % two-sided interval.
++#   The same resampled rows are used for the three models of a vehicle.
++BCA_B     = 10_000
++BCA_ALPHA = 0.025          # 2.5 % in each tail → 95 % interval
++BCA_SEED  = SEED
+ 
+ # ── Output paths ──────────────────────────────────────────────────────────────
+ OUTPUT_DIR       = "outputs"
+ CHECKPOINTS_DIR  = os.path.join(OUTPUT_DIR, "checkpoints")
+ PLOTS_DIR        = os.path.join(OUTPUT_DIR, "plots")
++# Per-vehicle prediction files (idx, a1_true, CDT_full_pred, User_specific_pred,
++# CDT_limited_pred) read by the Stage 1 fusion and BCa scripts
++PREDICTIONS_DIR  = os.path.join(OUTPUT_DIR, "predictions")
++# Test and training MAE / MSE per vehicle and model, long format (method,
++# vehicle, variant, test_MAE, test_MSE, train_MAE, train_MSE)
++METRICS_CSV      = os.path.join(OUTPUT_DIR, "metrics.csv")
+ PREDICTIONS_XLSX = os.path.join(OUTPUT_DIR, "predictions_all_vehicles.xlsx")
+ METRICS_XLSX     = os.path.join(OUTPUT_DIR, "metrics_summary.xlsx")
+ RESULTS_CSV      = os.path.join(OUTPUT_DIR, "patchtst_results.csv")
+diff --git a/main.py b/main.py
+index 6f72bdc..f101334 100644
+--- a/main.py
++++ b/main.py
+@@ -14,25 +14,34 @@
+ #   3. CDT with Limited Data  — trained on ~270 rows (~9/vehicle, seed=12).
+ #      Enables a fair matched-data comparison against User-Specific.
+ #
++# Training:
++#   No validation set. Every model trains on its training blocks only, for a
++#   fixed number of epochs (config.EPOCHS) with a constant learning rate, and
++#   keeps its final weights. The test blocks are used only for the final scores.
++#
+ # Evaluation:
+-#   Bootstrap MSE (50 trials × 20 samples without replacement) per vehicle.
+-#   Student-t 95 % CI computed from trial MSEs.
+-#   CI non-overlap ≡ statistically significant model difference (ANOVA H₁).
++#   Test: MAE and MSE on the 92 test blocks per vehicle (the same blocks for
++#   all three models), and the 95 % BCa bootstrap confidence interval of the
++#   MAE (B = 10,000 resamples with replacement; see src/bca.py).
++#   Training: MAE and MSE of each model on its own training blocks.
+ #
+ # Outputs (all written to outputs/):
+-#   checkpoints/vehicle_N.pt          best weights, User-Specific model
+-#   checkpoints/cdt_full.pt           best weights, CDT Full model
+-#   checkpoints/cdt_limited.pt        best weights, CDT Limited model
++#   checkpoints/vehicle_N.pt          final weights, User-Specific model
++#   checkpoints/cdt_full.pt           final weights, CDT Full model
++#   checkpoints/cdt_limited.pt        final weights, CDT Limited model
+ #   plots/vehicle_N.png               2-panel figure per vehicle
+ #   predictions_all_vehicles.xlsx     30-sheet Excel (one sheet/vehicle)
+-#   metrics_summary.xlsx              MSE + CI summary + MEAN row
++#   predictions/V{N}_Transformer_Predictions.csv   per-vehicle predictions
++#                                     (idx, a1_true, CDT_full_pred,
++#                                     User_specific_pred, CDT_limited_pred)
++#   metrics_summary.xlsx              MAE, MSE + BCa CI summary + MEAN row
+ #   patchtst_results.csv              raw per-vehicle results
+ #
+ # Usage
+ # ─────
+-#   python main.py                               # synthetic NGSIM data
+-#   python main.py --data data/ngsim.csv         # real NGSIM data
+-#   python main.py --vehicles 5 --epochs 20      # quick test
++#   python main.py --data data/ngsim_30_vehicles.csv      # real NGSIM data
++#   python main.py --synthetic                            # synthetic data
++#   python main.py --synthetic --vehicles 5 --epochs 20   # quick test
+ # =============================================================================
+ 
+ import argparse
+@@ -50,11 +59,14 @@ from src.data_utils   import (generate_synthetic_ngsim,
+                                build_cdt_datasets)
+ from src.model        import PatchTSTRegressor
+ from src.train        import train_model
+-from src.evaluate     import predict, bootstrap_mse, ci_overlap
++from src.evaluate     import (predict, evaluate_bca, bootstrap_indices,
++                               ci_overlap)
+ from src.plot         import plot_vehicle
+ from src.save_results import (save_predictions_excel,
+                                save_metrics_excel,
+-                               save_results_csv)
++                               save_results_csv,
++                               save_common_predictions,
++                               save_common_metrics)
+ 
+ 
+ # ─────────────────────────────────────────────────────────────────────────────
+@@ -79,8 +91,13 @@ def parse_args() -> argparse.Namespace:
+     p.add_argument(
+         "--data", type=str, default=None,
+         help="Path to NGSIM CSV.  Required columns: vehicle_id, vehicle_index, "
+-             "velocity, delta_x, delta_v, acceleration.  "
+-             "If omitted, synthetic NGSIM-like data is generated.",
++             "velocity, delta_x, delta_v, acceleration (optional: idx).  "
++             "Required unless --synthetic is given; a missing file is an error.",
++    )
++    p.add_argument(
++        "--synthetic", action="store_true",
++        help="Use generated synthetic NGSIM-like data instead of --data "
++             "(for testing only).",
+     )
+     p.add_argument(
+         "--vehicles", type=int, default=config.N_VEHICLES,
+@@ -88,16 +105,15 @@ def parse_args() -> argparse.Namespace:
+     )
+     p.add_argument(
+         "--epochs", type=int, default=config.EPOCHS,
+-        help="Maximum training epochs per model (early stopping usually triggers "
+-             "before this limit).",
++        help="Training epochs per model (fixed; no validation, no early stopping).",
+     )
+     p.add_argument(
+         "--batch", type=int, default=config.BATCH_SIZE,
+         help="Mini-batch size.",
+     )
+     p.add_argument(
+-        "--trials", type=int, default=config.N_BOOTSTRAP_TRIALS,
+-        help="Bootstrap trials for MSE confidence interval.",
++        "--boot", type=int, default=config.BCA_B,
++        help="Bootstrap resamples for the BCa confidence interval of the MAE.",
+     )
+     p.add_argument(
+         "--d_model", type=int, default=config.D_MODEL,
+@@ -114,6 +130,17 @@ def parse_args() -> argparse.Namespace:
+     return p.parse_args()
+ 
+ 
++# ─────────────────────────────────────────────────────────────────────────────
++# Training fit
++# ─────────────────────────────────────────────────────────────────────────────
++def train_fit(model: torch.nn.Module, dataset: AccelerationDataset) -> tuple:
++    """MAE and MSE of a trained model on the blocks it was trained on."""
++    y_hat = predict(model, dataset).astype(float)
++    y     = dataset.y.numpy().astype(float)
++    err   = y_hat - y
++    return float(np.mean(np.abs(err))), float(np.mean(err ** 2))
++
++
+ # ─────────────────────────────────────────────────────────────────────────────
+ # Experiment
+ # ─────────────────────────────────────────────────────────────────────────────
+@@ -122,7 +149,7 @@ def run_experiment(
+         vehicle_ids : list,
+         epochs      : int,
+         batch_size  : int,
+-        n_trials    : int,
++        n_boot      : int,
+         model_kwargs: dict,
+ ) -> tuple:
+     """
+@@ -130,8 +157,8 @@ def run_experiment(
+ 
+     Returns
+     -------
+-    results_df : pd.DataFrame  — one row per vehicle with all MSE metrics
+-    all_preds  : dict          — {vid: {y_true, y_us, y_cdt, y_ltd}}
++    results_df : pd.DataFrame  — one row per vehicle with MAE, MSE and BCa CIs
++    all_preds  : dict          — {vid: {idx, y_true, y_us, y_cdt, y_ltd}}
+     """
+     os.makedirs(config.CHECKPOINTS_DIR, exist_ok=True)
+     os.makedirs(config.PLOTS_DIR,       exist_ok=True)
+@@ -162,12 +189,13 @@ def run_experiment(
+     train_model(
+         cdt_full_mdl,
+         make_loader(cdt_full_ds, batch_size, shuffle=True),
+-        make_loader(cdt_full_ds, batch_size, shuffle=False),
+         checkpoint = cdt_full_ckpt,
+         epochs     = epochs,
+         verbose    = True,
+     )
++    train_cdt = train_fit(cdt_full_mdl, cdt_full_ds)
+     print(f"  Checkpoint saved → {cdt_full_ckpt}")
++    print(f"  Training MAE = {train_cdt[0]:.6f}  MSE = {train_cdt[1]:.6f}")
+ 
+     # ── 3. Train CDT Limited ──────────────────────────────────────────────────
+     print("\n  Training CDT with Limited Data …")
+@@ -177,14 +205,16 @@ def run_experiment(
+         train_model(
+             cdt_lim_mdl,
+             make_loader(cdt_limited_ds, batch_size, shuffle=True),
+-            make_loader(cdt_limited_ds, batch_size, shuffle=False),
+             checkpoint = cdt_lim_ckpt,
+             epochs     = epochs,
+             verbose    = True,
+         )
++        train_ltd = train_fit(cdt_lim_mdl, cdt_limited_ds)
+         print(f"  Checkpoint saved → {cdt_lim_ckpt}")
++        print(f"  Training MAE = {train_ltd[0]:.6f}  MSE = {train_ltd[1]:.6f}")
+     else:
+         torch.save(cdt_lim_mdl.state_dict(), cdt_lim_ckpt)
++        train_ltd = (float("nan"), float("nan"))
+         print("  WARNING: dataset too small — random-init weights saved to "
+               f"{cdt_lim_ckpt}")
+ 
+@@ -216,86 +246,97 @@ def run_experiment(
+         # Train User-Specific model
+         us_mdl  = PatchTSTRegressor(**model_kwargs)
+         us_ckpt = os.path.join(config.CHECKPOINTS_DIR, f"vehicle_{vid}.pt")
+-        t_losses, v_losses = train_model(
++        t_losses = train_model(
+             us_mdl,
+             make_loader(train_ds, batch_size, shuffle=True),
+-            make_loader(test_ds,  batch_size, shuffle=False),
+             checkpoint = us_ckpt,
+             epochs     = epochs,
+             verbose    = False,
+         )
++        train_us = train_fit(us_mdl, train_ds)
+         print(f"    Checkpoint   → {us_ckpt}")
++        print(f"    Training MAE = {train_us[0]:.6f}  MSE = {train_us[1]:.6f}")
+ 
+         # Predictions on test set (all three models share the same test blocks)
+-        y_true = test_ds.y.numpy()
+-        y_us   = predict(us_mdl,      test_ds)
+-        y_cdt  = predict(cdt_full_mdl, test_ds)
+-        y_ltd  = predict(cdt_lim_mdl,  test_ds)
++        y_true = test_df[config.TARGET].to_numpy(dtype=float)[config.INPUT_STEPS:]
++        y_us   = predict(us_mdl,      test_ds).astype(float)
++        y_cdt  = predict(cdt_full_mdl, test_ds).astype(float)
++        y_ltd  = predict(cdt_lim_mdl,  test_ds).astype(float)
++
++        # Row identifier of each target: the data's idx column when present
++        id_col     = "idx" if "idx" in test_df.columns else "vehicle_index"
++        target_idx = test_df[id_col].to_numpy()[config.INPUT_STEPS:]
+ 
+         all_preds[vid] = {
++            "idx"   : target_idx,
+             "y_true": y_true,
+             "y_us"  : y_us,
+             "y_cdt" : y_cdt,
+             "y_ltd" : y_ltd,
+         }
+ 
+-        # Bootstrap MSE + 95 % CI (50 trials × 20 samples without replacement)
+-        mse_us  = bootstrap_mse(y_true, y_us,  n_trials=n_trials)
+-        mse_cdt = bootstrap_mse(y_true, y_cdt, n_trials=n_trials)
+-        mse_ltd = bootstrap_mse(y_true, y_ltd, n_trials=n_trials)
++        # MAE, MSE and 95 % BCa CI of the MAE — the same resampled rows for
++        # all three models of this vehicle
++        boot_idx = bootstrap_indices(len(y_true), vid, n_boot)
++        res_us   = evaluate_bca(y_true, y_us,  boot_idx)
++        res_cdt  = evaluate_bca(y_true, y_cdt, boot_idx)
++        res_ltd  = evaluate_bca(y_true, y_ltd, boot_idx)
+ 
+-        # Ranking (ascending MSE = best first)
++        # Ranking (ascending MAE = best first)
+         ranked = sorted(
+-            [("User-Specific", mse_us["mean"]),
+-             ("CDT Full",      mse_cdt["mean"]),
+-             ("CDT Limited",   mse_ltd["mean"])],
++            [("User-Specific", res_us["mae"]),
++             ("CDT Full",      res_cdt["mae"]),
++             ("CDT Limited",   res_ltd["mae"])],
+             key=lambda x: x[1],
+         )
+         ranking_str    = " < ".join(m[0] for m in ranked)
+-        us_cdt_overlap = ci_overlap(mse_us, mse_cdt)
++        us_cdt_overlap = ci_overlap(res_us, res_cdt)
+ 
+         print(f"    Ranking      : {ranking_str}")
+-        print(f"    US   MSE = {mse_us['mean']:.6f}  "
+-              f"95%CI [{mse_us['ci_low']:.6f}, {mse_us['ci_high']:.6f}]")
+-        print(f"    CDT  MSE = {mse_cdt['mean']:.6f}  "
+-              f"95%CI [{mse_cdt['ci_low']:.6f}, {mse_cdt['ci_high']:.6f}]")
+-        print(f"    LTD  MSE = {mse_ltd['mean']:.6f}  "
+-              f"95%CI [{mse_ltd['ci_low']:.6f}, {mse_ltd['ci_high']:.6f}]")
+-        print(f"    CI overlap (US vs CDT): {us_cdt_overlap}  "
+-              f"({'null H₀ supported' if us_cdt_overlap else 'alt H₁ supported — significant diff'})")
++        for label, r in (("US ", res_us), ("CDT", res_cdt), ("LTD", res_ltd)):
++            print(f"    {label}  MAE = {r['mae']:.6f}  "
++                  f"BCa 95%CI [{r['ci_low']:.6f}, {r['ci_high']:.6f}]  "
++                  f"MSE = {r['mse']:.6f}")
++        print(f"    BCa CIs overlap (US vs CDT): {us_cdt_overlap}")
+ 
+         # Per-vehicle 2-panel plot
+         plot_path = plot_vehicle(
+             train_losses = t_losses,
+-            val_losses   = v_losses,
++            val_losses   = None,
+             y_true       = y_true,
+             y_us         = y_us,
+             y_cdt        = y_cdt,
+             y_ltd        = y_ltd,
+             vehicle_id   = vid,
+-            mse_us       = mse_us["mean"],
+-            mse_cdt      = mse_cdt["mean"],
+-            mse_ltd      = mse_ltd["mean"],
++            mse_us       = res_us["mse"],
++            mse_cdt      = res_cdt["mse"],
++            mse_ltd      = res_ltd["mse"],
+         )
+         print(f"    Plot         → {plot_path}")
+ 
+-        results.append({
++        row = {
+             "vehicle_id"        : vid,
+             "train_blocks"      : len(train_ds),
+             "test_blocks"       : len(test_ds),
+             "best_model"        : ranked[0][0],
+             "ranking"           : ranking_str,
+             "us_cdt_ci_overlap" : us_cdt_overlap,
+-            "mse_us_mean"       : mse_us["mean"],
+-            "mse_us_ci_low"     : mse_us["ci_low"],
+-            "mse_us_ci_high"    : mse_us["ci_high"],
+-            "mse_cdt_mean"      : mse_cdt["mean"],
+-            "mse_cdt_ci_low"    : mse_cdt["ci_low"],
+-            "mse_cdt_ci_high"   : mse_cdt["ci_high"],
+-            "mse_ltd_mean"      : mse_ltd["mean"],
+-            "mse_ltd_ci_low"    : mse_ltd["ci_low"],
+-            "mse_ltd_ci_high"   : mse_ltd["ci_high"],
+-        })
++        }
++        for key, r, tr in (("us", res_us, train_us), ("cdt", res_cdt, train_cdt),
++                           ("ltd", res_ltd, train_ltd)):
++            row.update({
++                f"mae_{key}"        : r["mae"],
++                f"mse_{key}"        : r["mse"],
++                f"train_mae_{key}"  : tr[0],
++                f"train_mse_{key}"  : tr[1],
++                f"bca_{key}_low"    : r["ci_low"],
++                f"bca_{key}_high"   : r["ci_high"],
++                f"bca_{key}_z0"     : r["z0"],
++                f"bca_{key}_a"      : r["a"],
++                f"bca_{key}_alpha1" : r["alpha1"],
++                f"bca_{key}_alpha2" : r["alpha2"],
++            })
++        results.append(row)
+ 
+     return pd.DataFrame(results), all_preds
+ 
+@@ -319,36 +360,33 @@ def print_summary(results_df: pd.DataFrame) -> None:
+     print(f"  Prediction horizon      : 1 step  (next timestep, 0.1 s)")
+     print(f"  Train blocks/vehicle    : {int(first['train_blocks'])}")
+     print(f"  Test  blocks/vehicle    : {int(first['test_blocks'])}")
+-    print(f"  Bootstrap trials        : {config.N_BOOTSTRAP_TRIALS} "
+-          f"× {config.BOOTSTRAP_SAMPLE} samples")
+-
+-    print(f"\n  Mean MSE ± std across {n} vehicles:")
+-    for label, col in [
+-        ("User-Specific PatchTST", "mse_us_mean"),
+-        ("CDT with Full Data     ", "mse_cdt_mean"),
+-        ("CDT with Limited Data  ", "mse_ltd_mean"),
++    print(f"  Confidence interval     : BCa, {config.BCA_B:,} resamples, 95 %")
++
++    print(f"\n  Mean test MAE ± std across {n} vehicles  (training MAE):")
++    for label, key in [
++        ("User-Specific PatchTST", "us"),
++        ("CDT with Full Data     ", "cdt"),
++        ("CDT with Limited Data  ", "ltd"),
+     ]:
+-        vals = results_df[col]
+-        print(f"    {label} : {vals.mean():.6f}  (std {vals.std():.6f})")
++        vals = results_df[f"mae_{key}"]
++        print(f"    {label} : {vals.mean():.6f}  (std {vals.std():.6f})  "
++              f"(training {results_df[f'train_mae_{key}'].mean():.6f})")
+ 
+-    print(f"\n  Best model per vehicle:")
++    print(f"\n  Best model per vehicle (lowest MAE):")
+     print(results_df["best_model"].value_counts().to_string())
+ 
+     olap = int(results_df["us_cdt_ci_overlap"].sum())
+-    print(f"\n  CI overlap (US vs CDT)     : {olap}/{n}  "
+-          f"(null H₀ — no significant difference)")
+-    print(f"  US statistically distinct  : {n - olap}/{n}  "
+-          f"(alt H₁ — significant difference)")
++    print(f"\n  BCa CIs overlap (US vs CDT): {olap}/{n} vehicles")
+ 
+     print(f"\n{'─' * 62}")
+-    print(f"  {'VID':>4}  {'US MSE':>10}  {'CDT MSE':>10}  "
+-          f"{'LTD MSE':>10}  {'Best':>14}  {'CI overlap':>10}")
++    print(f"  {'VID':>4}  {'US MAE':>10}  {'CDT MAE':>10}  "
++          f"{'LTD MAE':>10}  {'Best':>14}  {'CI overlap':>10}")
+     print(f"{'─' * 62}")
+     for _, r in results_df.iterrows():
+         print(f"  {int(r['vehicle_id']):>4}  "
+-              f"{r['mse_us_mean']:>10.6f}  "
+-              f"{r['mse_cdt_mean']:>10.6f}  "
+-              f"{r['mse_ltd_mean']:>10.6f}  "
++              f"{r['mae_us']:>10.6f}  "
++              f"{r['mae_cdt']:>10.6f}  "
++              f"{r['mae_ltd']:>10.6f}  "
+               f"{r['best_model']:>14}  "
+               f"{'Yes' if r['us_cdt_ci_overlap'] else 'No':>10}")
+     print(f"{'─' * 62}")
+@@ -361,7 +399,23 @@ def main() -> None:
+     args = parse_args()
+ 
+     # ── Load data ─────────────────────────────────────────────────────────────
+-    if args.data and os.path.exists(args.data):
++    # Synthetic data is used only when explicitly requested with --synthetic;
++    # a missing or wrong --data path stops the run with an error.
++    if args.synthetic:
++        print("  Generating synthetic NGSIM-like data (--synthetic) …")
++        df = generate_synthetic_ngsim(
++            n_vehicles = args.vehicles,
++            n_obs      = config.N_OBS,
++            seed       = config.SEED,
++        )
++        print(f"  Generated {len(df):,} rows · "
++              f"{df['vehicle_id'].nunique()} vehicles")
++    else:
++        if not args.data:
++            raise SystemExit("  ERROR: give the data file with --data "
++                             "(or --synthetic for synthetic test data).")
++        if not os.path.exists(args.data):
++            raise FileNotFoundError(f"--data file not found: {args.data}")
+         print(f"\n  Loading NGSIM data from: {args.data}")
+         df = pd.read_csv(args.data)
+         required = {
+@@ -374,19 +428,10 @@ def main() -> None:
+                 f"CSV is missing required columns: {missing}\n"
+                 f"Expected columns: {sorted(required)}"
+             )
++        # Rows must be in time order within each vehicle
++        df = df.sort_values(["vehicle_id", "vehicle_index"]).reset_index(drop=True)
+         print(f"  Loaded {len(df):,} rows · "
+               f"{df['vehicle_id'].nunique()} unique vehicles")
+-    else:
+-        if args.data:
+-            print(f"\n  WARNING: --data file not found: {args.data}")
+-        print("  Generating synthetic NGSIM-like data …")
+-        df = generate_synthetic_ngsim(
+-            n_vehicles = args.vehicles,
+-            n_obs      = config.N_OBS,
+-            seed       = config.SEED,
+-        )
+-        print(f"  Generated {len(df):,} rows · "
+-              f"{df['vehicle_id'].nunique()} vehicles")
+ 
+     vehicle_ids  = sorted(df["vehicle_id"].unique())[: args.vehicles]
+     model_kwargs = dict(
+@@ -409,12 +454,12 @@ def main() -> None:
+           f"{config.TRAIN_OBS - config.INPUT_STEPS} blocks")
+     print(f"  Test rows   : {config.TEST_OBS}/vehicle   → "
+           f"{config.TEST_OBS - config.INPUT_STEPS} blocks")
+-    print(f"  Epochs      : {args.epochs}  (early stop patience={config.EARLY_STOP_PATIENCE})")
++    print(f"  Epochs      : {args.epochs}  (fixed; no validation; constant LR {config.LR})")
+     print(f"  Batch size  : {args.batch}")
+     print(f"  d_model     : {args.d_model}  |  heads: {args.heads}  "
+           f"|  layers: {args.layers}")
+-    print(f"  Bootstrap   : {args.trials} trials × {config.BOOTSTRAP_SAMPLE} "
+-          "samples  (without replacement)")
++    print(f"  BCa CI      : {args.boot:,} resamples of the test blocks "
++          "(with replacement), 95 %")
+     print(f"\n  Output directory: {config.OUTPUT_DIR}/")
+ 
+     # ── Run ───────────────────────────────────────────────────────────────────
+@@ -423,7 +468,7 @@ def main() -> None:
+         vehicle_ids = vehicle_ids,
+         epochs      = args.epochs,
+         batch_size  = args.batch,
+-        n_trials    = args.trials,
++        n_boot      = args.boot,
+         model_kwargs= model_kwargs,
+     )
+ 
+@@ -435,6 +480,8 @@ def main() -> None:
+     print(f"{'=' * 62}")
+     save_results_csv(results_df)
+     save_predictions_excel(all_preds)
++    save_common_predictions(all_preds)
++    save_common_metrics(results_df)
+     save_metrics_excel(results_df)
+     print(f"\n  All outputs written to  {config.OUTPUT_DIR}/\n")
+ 
+diff --git a/src/bca.py b/src/bca.py
+new file mode 100644
+index 0000000..180cc54
+--- /dev/null
++++ b/src/bca.py
+@@ -0,0 +1,68 @@
++# =============================================================================
++# src/bca.py
++# BCa bootstrap confidence interval for the MAE, step by step as in the
++# protocol "BCa Bootstrap Confidence Intervals for the Mean Absolute Error of
++# Predicted Vehicle Acceleration" (Efron & Tibshirani, 1993, Ch. 6, 11, 13, 14).
++#
++#   Step 1  e_i = |ŷ_i − y_i|
++#   Step 2  θ̂ = mean(e)                                    observed MAE
++#   Step 3  B resamples of the n rows with replacement     → θ̂*(b)
++#   Step 4  ẑ0 = Φ⁻¹( #{θ̂*(b) < θ̂} / B )                 bias correction
++#   Step 5  jackknife θ̂(i) = (Σe − e_i)/(n − 1), θ̂(·) = mean
++#   Step 6  â = Σ(θ̂(·) − θ̂(i))³ / (6 [Σ(θ̂(·) − θ̂(i))²]^(3/2))
++#   Step 7  α1, α2 = Φ(ẑ0 + (ẑ0 + z)/(1 − â(ẑ0 + z))), z = z^(α), z^(1−α)
++#   Step 8  CI = percentiles α1, α2 of the sorted θ̂*, linear interpolation
++#           at position p·(B − 1)
++# =============================================================================
++
++import numpy as np
++from scipy.stats import norm
++
++
++def resample_indices(n: int, B: int, rng: np.random.Generator) -> np.ndarray:
++    """Step 3.1: B × n row numbers drawn at random with replacement."""
++    return rng.integers(0, n, size=(B, n))
++
++
++def bias_correction(boot: np.ndarray, theta_hat: float) -> float:
++    """Step 4. A proportion of exactly 0 or 1 is kept inside (0, 1)."""
++    B = len(boot)
++    prop = float(np.sum(boot < theta_hat)) / B
++    prop = min(max(prop, 0.5 / B), 1.0 - 0.5 / B)
++    return float(norm.ppf(prop))
++
++
++def acceleration(e: np.ndarray) -> float:
++    """Steps 5–6: jackknife (leave-one-out) MAEs and the acceleration constant."""
++    n = len(e)
++    theta_i = (e.sum() - e) / (n - 1)
++    d = theta_i.mean() - theta_i
++    den = 6.0 * float(np.sum(d ** 2)) ** 1.5
++    return float(np.sum(d ** 3) / den) if den > 0 else 0.0
++
++
++def adjusted_levels(z0: float, a: float, alpha: float) -> tuple:
++    """Step 7."""
++    z_lo, z_hi = norm.ppf(alpha), norm.ppf(1.0 - alpha)
++    a1 = norm.cdf(z0 + (z0 + z_lo) / (1.0 - a * (z0 + z_lo)))
++    a2 = norm.cdf(z0 + (z0 + z_hi) / (1.0 - a * (z0 + z_hi)))
++    return float(a1), float(a2)
++
++
++def bca_mae(y_true, y_pred, idx: np.ndarray, alpha: float) -> dict:
++    """Full protocol for one model on one vehicle. idx: (B, n) resampled rows."""
++    e = np.abs(np.asarray(y_pred, float) - np.asarray(y_true, float))   # Step 1
++    theta_hat = float(e.mean())                                          # Step 2
++    boot = e[idx].mean(axis=1)                                           # Step 3
++    z0 = bias_correction(boot, theta_hat)                                # Step 4
++    a_hat = acceleration(e)                                              # Steps 5–6
++    a1, a2 = adjusted_levels(z0, a_hat, alpha)                           # Step 7
++    lo, hi = np.quantile(boot, [a1, a2], method="linear")                # Step 8
++    return {
++        "mae": theta_hat,
++        "boot_mean": float(boot.mean()),
++        "boot_sd": float(boot.std(ddof=1)),
++        "z0": z0, "a": a_hat, "alpha1": a1, "alpha2": a2,
++        "ci_low": float(lo), "ci_high": float(hi),
++        "boot": boot,
++    }
+diff --git a/src/evaluate.py b/src/evaluate.py
+index d14dd4f..f2d3d67 100644
+--- a/src/evaluate.py
++++ b/src/evaluate.py
+@@ -1,12 +1,12 @@
+ # =============================================================================
+ # src/evaluate.py
+-# Inference and bootstrapped MSE evaluation with 95 % confidence intervals.
++# Inference, MAE / MSE, and the BCa 95 % confidence interval of the MAE.
+ #
+-# Evaluation protocol — identical to the dissertation's Stage 1:
+-#   50 bootstrap trials, each drawing 20 samples WITHOUT replacement from
+-#   the 92-block test set.  Student-t 95 % CI is computed from the 50 MSE
+-#   values.  CI non-overlap between two models is used as the ANOVA-equivalent
+-#   test of statistical significance (alternative hypothesis).
++# Evaluation protocol (Stage 1): BCa bootstrap confidence interval for the MAE
++# — B = 10,000 resamples of the 92 test blocks with replacement, bias
++# correction and jackknife acceleration (see src/bca.py and the protocol
++# "BCa Bootstrap Confidence Intervals for the Mean Absolute Error of Predicted
++# Vehicle Acceleration").
+ # =============================================================================
+ 
+ import sys
+@@ -16,10 +16,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+ import numpy as np
+ import torch
+ from torch.utils.data import DataLoader
+-from scipy import stats
+ 
+ import config
+ from src.data_utils import AccelerationDataset
++from src.bca import bca_mae, resample_indices
+ 
+ 
+ # ─────────────────────────────────────────────────────────────────────────────
+@@ -52,77 +52,53 @@ def predict(model: torch.nn.Module,
+ 
+ 
+ # ─────────────────────────────────────────────────────────────────────────────
+-# Bootstrap MSE  (matches dissertation protocol exactly)
++# MAE, MSE and BCa confidence interval of the MAE
+ # ─────────────────────────────────────────────────────────────────────────────
+ 
+-def bootstrap_mse(
+-        y_true     : np.ndarray,
+-        y_pred     : np.ndarray,
+-        n_trials   : int = config.N_BOOTSTRAP_TRIALS,
+-        sample_size: int = config.BOOTSTRAP_SAMPLE,
+-        seed       : int = config.SEED,
+-) -> dict:
++def bootstrap_indices(n: int, vehicle_id: int, B: int = config.BCA_B) -> np.ndarray:
+     """
+-    Bootstrapped MSE with 95 % Student-t confidence interval.
++    The B × n resampled row numbers for one vehicle. Seeded by (BCA_SEED,
++    vehicle) so the three models of a vehicle are evaluated on the same
++    resamples, and the result is reproducible.
++    """
++    rng = np.random.default_rng([config.BCA_SEED, int(vehicle_id)])
++    return resample_indices(n, B, rng)
+ 
+-    Protocol
+-    --------
+-    • n_trials independent draws (default 50)
+-    • Each draw: sample_size instances WITHOUT replacement (default 20)
+-    • MSE computed over the drawn subset
+-    • CI: Student-t interval at df = n_trials − 1
+ 
+-    Parameters
+-    ----------
+-    y_true      : ground-truth accelerations  (n_blocks,)
+-    y_pred      : predicted accelerations     (n_blocks,)
+-    n_trials    : number of bootstrap repetitions
+-    sample_size : instances sampled per trial (without replacement)
+-    seed        : RNG seed for reproducibility
++def evaluate_bca(y_true : np.ndarray,
++                 y_pred : np.ndarray,
++                 idx    : np.ndarray,
++                 alpha  : float = config.BCA_ALPHA) -> dict:
++    """
++    MAE, MSE and the 95 % BCa confidence interval of the MAE.
+ 
+     Returns
+     -------
+     dict with keys
+-        mean    : mean MSE across trials
+-        ci_low  : lower bound of 95 % CI
+-        ci_high : upper bound of 95 % CI
+-        std     : standard deviation of MSE values across trials
++        mae, mse            : on all test blocks
++        boot_mean, boot_sd  : mean and SD of the B bootstrap MAEs
++        z0, a               : bias-correction and acceleration constants
++        alpha1, alpha2      : adjusted percentile levels
++        ci_low, ci_high     : 95 % BCa interval of the MAE
++        boot                : the B bootstrap MAEs
+     """
+-    rng  = np.random.default_rng(seed)
+-    mses = []
+-    n    = len(y_true)
+-
+-    for _ in range(n_trials):
+-        idx  = rng.choice(n, size=min(sample_size, n), replace=False)
+-        mse  = float(np.mean((y_true[idx] - y_pred[idx]) ** 2))
+-        mses.append(mse)
+-
+-    mses = np.array(mses)
+-    ci   = stats.t.interval(
+-        0.95,
+-        df    = n_trials - 1,
+-        loc   = np.mean(mses),
+-        scale = stats.sem(mses),
+-    )
+-    return {
+-        "mean"   : float(np.mean(mses)),
+-        "ci_low" : float(ci[0]),
+-        "ci_high": float(ci[1]),
+-        "std"    : float(np.std(mses)),
+-    }
++    y_true = np.asarray(y_true, dtype=float)
++    y_pred = np.asarray(y_pred, dtype=float)
++    res = bca_mae(y_true, y_pred, idx, alpha)
++    res["mse"] = float(np.mean((y_pred - y_true) ** 2))
++    return res
+ 
+ 
+ # ─────────────────────────────────────────────────────────────────────────────
+-# CI overlap  (ANOVA-equivalent significance check)
++# CI overlap
+ # ─────────────────────────────────────────────────────────────────────────────
+ 
+ def ci_overlap(a: dict, b: dict) -> bool:
+     """
+-    Return True if the 95 % bootstrap CIs of two models overlap.
++    Return True if the 95 % BCa intervals of two models overlap.
+ 
+-    Interpretation (matches dissertation)
+-    ──────────────────────────────────────
+-    • Overlap     → null hypothesis: no statistically significant difference
+-    • No overlap  → alternative hypothesis: one model is significantly better
++    Descriptive only: two intervals that do not overlap indicate a clear
++    difference, but overlapping intervals do not by themselves show that the
++    difference is not statistically significant.
+     """
+     return a["ci_low"] <= b["ci_high"] and b["ci_low"] <= a["ci_high"]
+diff --git a/src/plot.py b/src/plot.py
+index 5e70f6c..3c5fa53 100644
+--- a/src/plot.py
++++ b/src/plot.py
+@@ -2,7 +2,7 @@
+ # src/plot.py
+ # Per-vehicle 2-panel PNG figure.
+ #
+-# Panel 1 — User-Specific PatchTST training & validation loss curves
++# Panel 1 — User-Specific PatchTST training loss curve (no validation set)
+ # Panel 2 — Ground truth vs predictions from all three models on the test set
+ # =============================================================================
+ 
+@@ -20,7 +20,7 @@ import config
+ 
+ def plot_vehicle(
+         train_losses : list,
+-        val_losses   : list,
++        val_losses   : list,          # None: no validation curve
+         y_true       : np.ndarray,
+         y_us         : np.ndarray,
+         y_cdt        : np.ndarray,
+@@ -33,9 +33,9 @@ def plot_vehicle(
+     """
+     Save a 2-panel figure to outputs/plots/vehicle_{vehicle_id}.png.
+ 
+-    Panel 1 — Loss curves
+-        Training and validation MSE per epoch for the User-Specific model.
+-        Shows convergence behaviour and whether early stopping was triggered.
++    Panel 1 — Loss curve
++        Training MSE per epoch for the User-Specific model (and validation MSE
++        only if a validation curve is passed; the Stage 1 runs pass none).
+ 
+     Panel 2 — Predictions vs ground truth
+         Test-set acceleration (m/s²) for all 92 test blocks.
+@@ -45,13 +45,13 @@ def plot_vehicle(
+     Parameters
+     ----------
+     train_losses : per-epoch training MSE  (User-Specific model)
+-    val_losses   : per-epoch validation MSE  (User-Specific model)
++    val_losses   : per-epoch validation MSE, optional (None: not plotted)
+     y_true       : ground-truth accelerations on the 92 test blocks
+     y_us         : User-Specific PatchTST predictions
+     y_cdt        : CDT with Full Data predictions
+     y_ltd        : CDT with Limited Data predictions
+     vehicle_id   : integer ID used in title and filename
+-    mse_us/cdt/ltd : bootstrapped mean MSE for each model
++    mse_us/cdt/ltd : test MSE for each model
+ 
+     Returns
+     -------
+@@ -69,15 +69,17 @@ def plot_vehicle(
+         fontweight="bold",
+     )
+ 
+-    # ── Panel 1: Training & validation loss ───────────────────────────────────
++    # ── Panel 1: Training loss ────────────────────────────────────────────────
+     ax = axes[0]
+     ax.plot(train_losses, lw=1.6, color="#2077B4",
+             label="Train MSE  (User-Specific)")
+-    ax.plot(val_losses,   lw=1.6, color="#D62728",
+-            label="Val MSE    (User-Specific)", linestyle="--")
++    if val_losses is not None:
++        ax.plot(val_losses, lw=1.6, color="#D62728",
++                label="Val MSE    (User-Specific)", linestyle="--")
+     ax.set_xlabel("Epoch", fontsize=10)
+     ax.set_ylabel("MSE  (m/s²)²", fontsize=10)
+-    ax.set_title("User-Specific PatchTST — Training & Validation Loss",
++    ax.set_title("User-Specific PatchTST — Training Loss"
++                 + (" & Validation Loss" if val_losses is not None else ""),
+                  fontsize=10)
+     ax.legend(fontsize=9)
+     ax.grid(alpha=0.3)
+diff --git a/src/save_results.py b/src/save_results.py
+index f34d867..8af6ae0 100644
+--- a/src/save_results.py
++++ b/src/save_results.py
+@@ -4,22 +4,33 @@
+ #
+ # predictions_all_vehicles.xlsx
+ #     One sheet per vehicle (Vehicle_1 … Vehicle_30).
+-#     Columns: block_index, ground_truth, pred_user_specific,
++#     Columns: block_index, idx, ground_truth, pred_user_specific,
+ #              pred_cdt_full, pred_cdt_limited,
+ #              error_us, error_cdt, error_ltd,
+ #              sq_error_us, sq_error_cdt, sq_error_ltd
+ #     (sq_error = squared error per block; MSE = mean of this column)
+ #
++# predictions/V{N}_Transformer_Predictions.csv
++#     One file per vehicle in the Stage 1 common layout:
++#     idx, a1_true, CDT_full_pred, User_specific_pred, CDT_limited_pred
++#
+ # metrics_summary.xlsx
+-#     Single sheet "MSE_Summary" with one row per vehicle and a MEAN row.
++#     Single sheet "MAE_Summary" with one row per vehicle and a MEAN row.
+ #     Columns: vehicle_id, best_model, ranking,
+-#              US_MSE_mean, US_MSE_CI_low, US_MSE_CI_high,
+-#              CDT_MSE_mean, CDT_MSE_CI_low, CDT_MSE_CI_high,
+-#              LTD_MSE_mean, LTD_MSE_CI_low, LTD_MSE_CI_high,
+-#              US_CDT_CI_overlap
++#              US_MAE, US_MSE, US_BCa_CI_low, US_BCa_CI_high,
++#              CDT_MAE, CDT_MSE, CDT_BCa_CI_low, CDT_BCa_CI_high,
++#              LTD_MAE, LTD_MSE, LTD_BCa_CI_low, LTD_BCa_CI_high,
++#              US_CDT_CI_overlap, and {US,CDT,LTD}_train_MAE / _train_MSE
++#     (BCa CI = 95 % BCa bootstrap confidence interval of the test MAE;
++#      train_* = each model on its own training blocks)
++#
++# metrics.csv
++#     Test and training MAE / MSE, one row per vehicle and model (Stage 1
++#     long format: method, vehicle, variant, test_MAE, test_MSE, train_MAE,
++#     train_MSE).
+ #
+ # patchtst_results.csv
+-#     Same columns as metrics_summary.xlsx but in CSV for downstream analysis.
++#     All per-vehicle results (including ẑ0, â, α1, α2 of each BCa interval).
+ # =============================================================================
+ 
+ import sys
+@@ -71,6 +82,7 @@ def save_predictions_excel(all_preds: dict) -> None:
+ 
+             df = pd.DataFrame({
+                 "block_index"         : np.arange(len(y_true)),
++                "idx"                 : d["idx"],
+                 "ground_truth"        : np.round(y_true, 6),
+                 "pred_user_specific"  : np.round(y_us,   6),
+                 "pred_cdt_full"       : np.round(y_cdt,  6),
+@@ -92,12 +104,63 @@ def save_predictions_excel(all_preds: dict) -> None:
+ 
+ 
+ # ─────────────────────────────────────────────────────────────────────────────
+-# Metrics summary Excel  (MSE + bootstrap CI only)
++# Per-vehicle prediction files in the Stage 1 common layout
++# ─────────────────────────────────────────────────────────────────────────────
++
++def save_common_predictions(all_preds: dict) -> None:
++    """
++    One CSV per vehicle with the columns read by the Stage 1 fusion and BCa
++    scripts: idx (target row), a1_true, CDT_full_pred, User_specific_pred,
++    CDT_limited_pred.
++    """
++    os.makedirs(config.PREDICTIONS_DIR, exist_ok=True)
++    for vid in sorted(all_preds.keys()):
++        d = all_preds[vid]
++        pd.DataFrame({
++            "idx"                : d["idx"],
++            "a1_true"            : np.asarray(d["y_true"], dtype=float),
++            "CDT_full_pred"      : np.asarray(d["y_cdt"],  dtype=float),
++            "User_specific_pred" : np.asarray(d["y_us"],   dtype=float),
++            "CDT_limited_pred"   : np.asarray(d["y_ltd"],  dtype=float),
++        }).to_csv(os.path.join(config.PREDICTIONS_DIR,
++                               f"V{vid}_Transformer_Predictions.csv"),
++                  index=False)
++    print(f"  Predictions  →  {config.PREDICTIONS_DIR}/  "
++          f"({len(all_preds)} files)")
++
++
++def save_common_metrics(results_df: pd.DataFrame) -> None:
++    """
++    Test and training MAE / MSE in the Stage 1 long format read by
++    export_excel.py: method, vehicle, variant, test_MAE, test_MSE, train_MAE,
++    train_MSE. Training values are on each model's own training blocks, so the
++    CDT values repeat for every vehicle.
++    """
++    rows = []
++    for _, r in results_df.iterrows():
++        for variant, key in (("User-specific", "us"), ("CDT Full", "cdt"),
++                             ("CDT Limited", "ltd")):
++            rows.append({
++                "method"   : "Transformer",
++                "vehicle"  : int(r["vehicle_id"]),
++                "variant"  : variant,
++                "test_MAE" : r[f"mae_{key}"],
++                "test_MSE" : r[f"mse_{key}"],
++                "train_MAE": r[f"train_mae_{key}"],
++                "train_MSE": r[f"train_mse_{key}"],
++            })
++    os.makedirs(os.path.dirname(config.METRICS_CSV) or ".", exist_ok=True)
++    pd.DataFrame(rows).to_csv(config.METRICS_CSV, index=False)
++    print(f"  Metrics CSV  →  {config.METRICS_CSV}")
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Metrics summary Excel  (MAE, MSE and BCa CI of the MAE)
+ # ─────────────────────────────────────────────────────────────────────────────
+ 
+ def save_metrics_excel(results_df: pd.DataFrame) -> None:
+     """
+-    Write the MSE summary Excel with one row per vehicle + a MEAN row.
++    Write the MAE summary Excel with one row per vehicle + a MEAN row.
+ 
+     Parameters
+     ----------
+@@ -105,35 +168,30 @@ def save_metrics_excel(results_df: pd.DataFrame) -> None:
+     """
+     rows = []
+     for _, r in results_df.iterrows():
+-        rows.append({
++        row = {
+             "vehicle_id"        : int(r["vehicle_id"]),
+             "train_blocks"      : int(r["train_blocks"]),
+             "test_blocks"       : int(r["test_blocks"]),
+             "best_model"        : r["best_model"],
+             "ranking"           : r["ranking"],
+-            # User-Specific
+-            "US_MSE_mean"       : round(r["mse_us_mean"],    6),
+-            "US_MSE_CI_low"     : round(r["mse_us_ci_low"],  6),
+-            "US_MSE_CI_high"    : round(r["mse_us_ci_high"], 6),
+-            # CDT Full
+-            "CDT_MSE_mean"      : round(r["mse_cdt_mean"],   6),
+-            "CDT_MSE_CI_low"    : round(r["mse_cdt_ci_low"], 6),
+-            "CDT_MSE_CI_high"   : round(r["mse_cdt_ci_high"],6),
+-            # CDT Limited
+-            "LTD_MSE_mean"      : round(r["mse_ltd_mean"],   6),
+-            "LTD_MSE_CI_low"    : round(r["mse_ltd_ci_low"], 6),
+-            "LTD_MSE_CI_high"   : round(r["mse_ltd_ci_high"],6),
+-            # Significance
+-            "US_CDT_CI_overlap" : r["us_cdt_ci_overlap"],
+-        })
++        }
++        for label, key in (("US", "us"), ("CDT", "cdt"), ("LTD", "ltd")):
++            row.update({
++                f"{label}_MAE"         : round(r[f"mae_{key}"],      6),
++                f"{label}_MSE"         : round(r[f"mse_{key}"],      6),
++                f"{label}_BCa_CI_low"  : round(r[f"bca_{key}_low"],  6),
++                f"{label}_BCa_CI_high" : round(r[f"bca_{key}_high"], 6),
++                f"{label}_train_MAE"   : round(r[f"train_mae_{key}"], 6),
++                f"{label}_train_MSE"   : round(r[f"train_mse_{key}"], 6),
++            })
++        row["US_CDT_CI_overlap"] = r["us_cdt_ci_overlap"]
++        rows.append(row)
+ 
+     df = pd.DataFrame(rows)
+ 
+-    num_cols = [
+-        "US_MSE_mean",  "US_MSE_CI_low",  "US_MSE_CI_high",
+-        "CDT_MSE_mean", "CDT_MSE_CI_low", "CDT_MSE_CI_high",
+-        "LTD_MSE_mean", "LTD_MSE_CI_low", "LTD_MSE_CI_high",
+-    ]
++    num_cols = [f"{label}_{m}" for label in ("US", "CDT", "LTD")
++                for m in ("MAE", "MSE", "BCa_CI_low", "BCa_CI_high",
++                          "train_MAE", "train_MSE")]
+     summary = {c: round(float(df[c].mean()), 6) for c in num_cols}
+     summary.update({
+         "vehicle_id": "MEAN", "train_blocks": "", "test_blocks": "",
+@@ -143,8 +201,8 @@ def save_metrics_excel(results_df: pd.DataFrame) -> None:
+ 
+     os.makedirs(os.path.dirname(config.METRICS_XLSX) or ".", exist_ok=True)
+     with pd.ExcelWriter(config.METRICS_XLSX, engine="openpyxl") as writer:
+-        df.to_excel(writer, sheet_name="MSE_Summary", index=False)
+-        _autosize(writer.sheets["MSE_Summary"])
++        df.to_excel(writer, sheet_name="MAE_Summary", index=False)
++        _autosize(writer.sheets["MAE_Summary"])
+ 
+     print(f"  Metrics      →  {config.METRICS_XLSX}")
+ 
+diff --git a/src/train.py b/src/train.py
+index 2c00fa9..33c9995 100644
+--- a/src/train.py
++++ b/src/train.py
+@@ -1,7 +1,7 @@
+ # =============================================================================
+ # src/train.py
+-# Training loop with Adam, ReduceLROnPlateau, gradient clipping,
+-# early stopping, and best-weight checkpoint saving.
++# Training loop: Adam, MSE loss, gradient clipping, a fixed number of epochs
++# and a constant learning rate. No validation set: the final weights are kept.
+ # =============================================================================
+ 
+ import sys
+@@ -18,64 +18,44 @@ import config
+ def train_model(
+         model        : nn.Module,
+         train_loader : DataLoader,
+-        val_loader   : DataLoader,
+         checkpoint   : str,
+         epochs       : int   = config.EPOCHS,
+         lr           : float = config.LR,
+-        patience     : int   = config.EARLY_STOP_PATIENCE,
+         verbose      : bool  = False,
+-) -> tuple:
++) -> list:
+     """
+-    Train a PatchTSTRegressor with MSE loss, early stopping, and checkpointing.
++    Train a PatchTSTRegressor with MSE loss for a fixed number of epochs.
+ 
+     Protocol
+     --------
+     • Loss      : MSELoss (matches dissertation evaluation metric)
+-    • Optimiser : Adam  (lr=1e-3, adjustable via config)
+-    • Scheduler : ReduceLROnPlateau (factor=0.5, patience=5)
++    • Optimiser : Adam, constant learning rate (lr=1e-3, adjustable via config)
+     • Grad clip : ℓ₂ norm clipped at 1.0 to prevent exploding gradients
+-    • Early stop: training halts when validation MSE fails to improve for
+-                  `patience` consecutive epochs
+-    • Checkpoint: best weights (lowest val MSE) saved to `checkpoint` path
+-                  and reloaded before return
++    • Epochs    : fixed (config.EPOCHS); no validation set, no early stopping
++    • Checkpoint: the final weights are saved to `checkpoint`
+ 
+     Parameters
+     ----------
+     model        : PatchTSTRegressor (or any nn.Module)
+     train_loader : DataLoader for the training split
+-    val_loader   : DataLoader for the validation / test split
+-    checkpoint   : file path (.pt) where the best weights are saved
+-    epochs       : maximum training epochs
+-    lr           : Adam initial learning rate
+-    patience     : early-stopping patience in epochs
+-    verbose      : if True, print loss every 5 epochs + early-stop message
++    checkpoint   : file path (.pt) where the final weights are saved
++    epochs       : number of training epochs
++    lr           : Adam learning rate
++    verbose      : if True, print the training loss every 5 epochs
+ 
+     Returns
+     -------
+     train_losses : list[float]  — per-epoch training MSE
+-    val_losses   : list[float]  — per-epoch validation MSE
+     """
+     os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
+     model.to(config.DEVICE)
+ 
+     criterion = nn.MSELoss()
+     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+-        optimizer,
+-        mode    = "min",
+-        factor  = config.LR_FACTOR,
+-        patience= config.LR_PATIENCE,
+-    )
+ 
+     train_losses : list[float] = []
+-    val_losses   : list[float] = []
+-    best_val     = float("inf")
+-    wait         = 0
+-    best_state   = None
+ 
+     for epoch in range(1, epochs + 1):
+-
+-        # ── Training pass ─────────────────────────────────────────────────────
+         model.train()
+         running = 0.0
+         for Xb, yb in train_loader:
+@@ -87,41 +67,11 @@ def train_model(
+             optimizer.step()
+             running += loss.item() * len(Xb)
+         t_loss = running / len(train_loader.dataset)
+-
+-        # ── Validation pass ───────────────────────────────────────────────────
+-        model.eval()
+-        running = 0.0
+-        with torch.no_grad():
+-            for Xb, yb in val_loader:
+-                Xb, yb = Xb.to(config.DEVICE), yb.to(config.DEVICE)
+-                running += criterion(model(Xb), yb).item() * len(Xb)
+-        v_loss = running / len(val_loader.dataset)
+-
+         train_losses.append(t_loss)
+-        val_losses.append(v_loss)
+-        scheduler.step(v_loss)
+-
+-        # ── Checkpoint & early stopping ───────────────────────────────────────
+-        if v_loss < best_val:
+-            best_val   = v_loss
+-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+-            torch.save(best_state, checkpoint)
+-            wait = 0
+-        else:
+-            wait += 1
+-            if wait >= patience:
+-                if verbose:
+-                    print(f"    Early stop at epoch {epoch}  "
+-                          f"(best val MSE = {best_val:.6f})")
+-                break
+ 
+         if verbose and epoch % 5 == 0:
+-            print(f"    Epoch {epoch:4d}/{epochs}  "
+-                  f"train={t_loss:.6f}  val={v_loss:.6f}  "
+-                  f"best={best_val:.6f}")
+-
+-    # Restore best weights before returning
+-    if best_state is not None:
+-        model.load_state_dict(best_state)
++            print(f"    Epoch {epoch:4d}/{epochs}  train={t_loss:.6f}")
+ 
+-    return train_losses, val_losses
++    torch.save({k: v.detach().clone() for k, v in model.state_dict().items()}, checkpoint)
++    model.eval()
++    return train_losses
+diff --git a/tests/test_smoke.py b/tests/test_smoke.py
+index 02d5e5d..dbb6b73 100644
+--- a/tests/test_smoke.py
++++ b/tests/test_smoke.py
+@@ -20,7 +20,9 @@ from src.data_utils import (generate_synthetic_ngsim,
+                              make_loader,
+                              build_cdt_datasets)
+ from src.model    import PatchTSTRegressor
+-from src.evaluate import predict, bootstrap_mse, ci_overlap
++from src.train    import train_model
++from src.evaluate import predict, evaluate_bca, bootstrap_indices, ci_overlap
++from src.bca      import bias_correction, adjusted_levels
+ 
+ 
+ # ─────────────────────────────────────────────────────────────────────────────
+@@ -128,19 +130,42 @@ def test_predict_shape(tiny_model, vehicle_ds):
+     assert preds.shape == (len(vehicle_ds),)
+ 
+ 
+-def test_bootstrap_mse_structure():
+-    y_t = np.random.randn(92).astype(np.float32)
+-    y_p = np.random.randn(92).astype(np.float32)
+-    res = bootstrap_mse(y_t, y_p, n_trials=10, sample_size=10)
+-    assert set(res.keys()) == {"mean", "ci_low", "ci_high", "std"}
+-    assert res["ci_low"] <= res["mean"] <= res["ci_high"]
+-    assert res["std"] >= 0
+-
+-
+-def test_bootstrap_mse_perfect_prediction():
+-    y = np.ones(92, dtype=np.float32)
+-    res = bootstrap_mse(y, y, n_trials=10, sample_size=10)
+-    assert abs(res["mean"]) < 1e-9
++def test_train_model_fixed_epochs_no_validation(vehicle_ds, tmp_path):
++    """Trains for exactly `epochs` epochs on training data only and saves the final weights."""
++    model = PatchTSTRegressor(d_model=16, nhead=2, num_layers=1, ffn_dim=32)
++    ckpt = tmp_path / "model.pt"
++    losses = train_model(model, make_loader(vehicle_ds, 16, shuffle=True),
++                         checkpoint=str(ckpt), epochs=3)
++    assert len(losses) == 3
++    assert all(np.isfinite(losses))
++    assert ckpt.exists()
++
++
++def test_bca_structure():
++    rng = np.random.default_rng(0)
++    y_t = rng.standard_normal(92)
++    y_p = rng.standard_normal(92)
++    res = evaluate_bca(y_t, y_p, bootstrap_indices(92, vehicle_id=1, B=2000))
++    for key in ("mae", "mse", "ci_low", "ci_high", "z0", "a", "alpha1", "alpha2"):
++        assert key in res
++    assert res["ci_low"] <= res["mae"] <= res["ci_high"]
++    assert len(res["boot"]) == 2000
++
++
++def test_bca_perfect_prediction():
++    y = np.ones(92)
++    res = evaluate_bca(y, y, bootstrap_indices(92, vehicle_id=1, B=500))
++    assert res["mae"] == 0 and res["ci_low"] == 0 and res["ci_high"] == 0
++
++
++def test_bca_protocol_example_1():
++    """Example 1 of the BCa protocol: θ̂ = 5.0, ten bootstrap values, â = 0."""
++    boot = np.array([3.8, 4.1, 4.3, 4.5, 4.7, 4.8, 4.9, 5.2, 5.6, 6.3])
++    z0 = bias_correction(boot, 5.0)
++    a1, a2 = adjusted_levels(z0, 0.0, 0.025)
++    lo, hi = np.quantile(boot, [a1, a2], method="linear")
++    assert abs(z0 - 0.52) < 0.01
++    assert abs(lo - 4.23) < 0.005 and abs(hi - 6.29) < 0.005
+ 
+ 
+ def test_ci_overlap_overlapping():
